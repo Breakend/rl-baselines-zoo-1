@@ -10,11 +10,10 @@ try:
     import pybullet_envs
 except ImportError:
     pybullet_envs = None
-
 from gym.envs.registration import load
 
 from stable_baselines.deepq.policies import FeedForwardPolicy
-from stable_baselines.common.policies import FeedForwardPolicy as BasePolicy
+from stable_baselines.common.policies import FeedForwardPolicy as BasePolicy, CnnPolicy
 from stable_baselines.common.policies import register_policy
 from stable_baselines.sac.policies import FeedForwardPolicy as SACPolicy
 from stable_baselines.bench import Monitor
@@ -24,6 +23,195 @@ from stable_baselines.common.vec_env import DummyVecEnv, VecNormalize, \
     VecFrameStack, SubprocVecEnv
 from stable_baselines.common.cmd_util import make_atari_env
 from stable_baselines.common import set_global_seeds
+import utils.mobilenet_v1 as mobilenet_v1
+
+import numpy as np
+import tensorflow as tf
+from gym.spaces import Discrete
+
+from stable_baselines.a2c.utils import conv, linear, conv_to_fc, batch_to_seq, seq_to_batch, lstm, ortho_init
+from stable_baselines.common.distributions import make_proba_dist_type, CategoricalProbabilityDistribution, \
+    MultiCategoricalProbabilityDistribution, DiagGaussianProbabilityDistribution, BernoulliProbabilityDistribution
+from stable_baselines.common.input import observation_input
+import utils.channel_net_ops as ops
+slim = tf.contrib.slim
+
+
+init_scale=1.0
+def separable_conv(input_tensor, scope, *, n_filters, filter_size, stride,
+         pad='VALID', channel_multiplier=1, init_scale=1.0, data_format='NHWC', one_dim_bias=False):
+    """
+    Creates a 2d convolutional layer for TensorFlow
+    :param input_tensor: (TensorFlow Tensor) The input tensor for the convolution
+    :param scope: (str) The TensorFlow variable scope
+    :param n_filters: (int) The number of filters
+    :param filter_size:  (Union[int, [int], tuple<int, int>]) The filter size for the squared kernel matrix,
+    or the height and width of kernel filter if the input is a list or tuple
+    :param stride: (int) The stride of the convolution
+    :param pad: (str) The padding type ('VALID' or 'SAME')
+    :param init_scale: (int) The initialization scale
+    :param data_format: (str) The data format for the convolution weights
+    :param one_dim_bias: (bool) If the bias should be one dimentional or not
+    :return: (TensorFlow Tensor) 2d convolutional layer
+    """
+    if isinstance(filter_size, list) or isinstance(filter_size, tuple):
+        assert len(filter_size) == 2, \
+            "Filter size must have 2 elements (height, width), {} were given".format(len(filter_size))
+        filter_height = filter_size[0]
+        filter_width = filter_size[1]
+    else:
+        filter_height = filter_size
+        filter_width = filter_size
+    if data_format == 'NHWC':
+        channel_ax = 3
+        strides = [1, stride, stride, 1]
+        bshape = [1, 1, 1, n_filters]
+    elif data_format == 'NCHW':
+        channel_ax = 1
+        strides = [1, 1, stride, stride]
+        bshape = [1, n_filters, 1, 1]
+    else:
+        raise NotImplementedError
+    bias_var_shape = [n_filters] if one_dim_bias else [1, n_filters, 1, 1]
+    n_input = input_tensor.get_shape()[channel_ax].value
+    wshape = [filter_height, filter_width, n_input, n_filters]
+    with tf.variable_scope(scope):
+        depthwise_filter = tf.get_variable(shape=(filter_height, filter_width, n_input, channel_multiplier), name="deptwise_filter", initializer=ortho_init(init_scale))
+        pointwise_filter = tf.get_variable(shape=[1, 1, channel_multiplier * n_input, n_filters], name="pointwise_filter", initializer=ortho_init(init_scale))
+        bias = tf.get_variable("b", bias_var_shape, initializer=tf.constant_initializer(0.0))
+        if not one_dim_bias and data_format == 'NHWC':
+            bias = tf.reshape(bias, bshape)
+
+        output = tf.nn.separable_conv2d(
+            input_tensor,
+            depthwise_filter,
+            pointwise_filter,
+            strides=strides,
+            padding=pad,
+            data_format=data_format
+        )
+        return bias + output 
+
+
+
+def Depthwise(x, in_channels, stride=1, is_training=True, scope='depthwise', kernel_size=3):
+    with tf.variable_scope(scope):
+        w = tf.get_variable('weights', (kernel_size, kernel_size, in_channels, 1),
+                            initializer=ortho_init(init_scale))
+        x = tf.nn.depthwise_conv2d(x, w, (1, 1, stride, stride), 'SAME',
+                                   data_format='NCHW')
+        x = tf.nn.relu(x)
+        return x
+
+
+def get_mask(in_channels, kernel_size=3):
+    in_channels = int(in_channels)
+    mask = np.zeros((kernel_size, kernel_size, in_channels, in_channels))
+    for _ in range(in_channels):
+        mask[:, :, _, _] = 1.
+    return mask
+
+
+def Conv3x3(x, in_channels, out_channels, stride=1, is_training=True,
+        scope='convolution', kernel_size=3):
+    with tf.variable_scope(scope):
+        w = tf.get_variable('weight', shape=(kernel_size, kernel_size, in_channels, out_channels),
+                            initializer=ortho_init(init_scale))
+        x = tf.nn.conv2d(x, w, (1, 1, stride, stride), 'SAME',
+                         data_format='NCHW')
+        x = tf.nn.relu(x)
+        return x
+
+def DiagonalwiseRefactorization(x, in_channels, stride=1, groups=4,
+        is_training=True, scope='depthwise', kernel_size=3):
+    with tf.variable_scope(scope):
+        channels = int(in_channels / groups)
+        mask = tf.constant(get_mask(channels, kernel_size).tolist(), dtype=tf.float32,
+                           shape=(kernel_size, kernel_size, channels, channels))
+        splitw = [
+            tf.get_variable('weights_%d' % _, (kernel_size, kernel_size, channels, channels),
+                            initializer=ortho_init(init_scale))
+            for _ in range(groups)
+        ]
+        splitw = [tf.multiply(w, mask) for w in splitw]
+        splitx = tf.split(x, groups, 1)
+        splitx = [tf.nn.conv2d(x, w, (1, 1, stride, stride), 'SAME',
+                               data_format='NCHW')
+                  for x, w in zip(splitx, splitw)]
+        x = tf.concat(splitx, 1)
+        x = tf.nn.relu(x)
+        return x
+
+def Pointwise(x, in_channels, out_channels, is_training=True,
+        scope='pointwise'):
+    with tf.variable_scope(scope):
+        w = tf.get_variable('weights', (1, 1, in_channels, out_channels),
+                            initializer=ortho_init(init_scale))
+        x = tf.nn.conv2d(x, w, (1, 1, 1, 1), 'SAME', data_format='NCHW')
+        x = tf.nn.relu(x)
+        return x
+
+def Separable(x, in_channels, out_channels, stride=1, is_training=True,
+        scope='separable', kernel_size=3):
+    with tf.variable_scope(scope):
+        # Diagonalwise Refactorization
+        # groups = in_channels
+        # groups = 16
+        groups = int(max(in_channels / 32, 1))
+        x = DiagonalwiseRefactorization(x, in_channels, stride, groups,
+                                        is_training, 'depthwise', kernel_size=kernel_size)
+
+        # Specialized Kernel
+        # x = Depthwise(x, in_channels, stride, is_training, 'depthwise')
+
+        # Standard Convolution
+        # x = Conv3x3(x, in_channels, in_channels, stride, is_training,
+                    # 'convolution')
+        x = Pointwise(x, in_channels, out_channels, is_training, 'pointwise')
+        return x
+
+def lower_flop_nature_cnn(scaled_images, **kwargs):
+    """
+    CNN from Nature paper.
+    :param scaled_images: (TensorFlow Tensor) Image input placeholder
+    :param kwargs: (dict) Extra keywords parameters for the convolutional layers of the CNN
+    :return: (TensorFlow Tensor) The CNN output layer
+    """
+    activ = tf.nn.relu
+    layer_1 = activ(conv(scaled_images, 'c1', n_filters=32, filter_size=8, stride=4, init_scale=np.sqrt(2), **kwargs))
+    layer_2 = activ(conv(layer_1, 'c2', n_filters=32, filter_size=4, stride=2, init_scale=np.sqrt(2), **kwargs))
+    layer_3 = activ(conv(layer_2, 'c3', n_filters=64, filter_size=3, stride=1, init_scale=np.sqrt(2), **kwargs))
+    layer_3 = conv_to_fc(layer_3)
+    return activ(linear(layer_3, 'fc1', n_hidden=512, init_scale=np.sqrt(2)))
+    
+
+def mobilenet_cnn(images, **kwargs):
+    activ = tf.nn.relu
+    #TODO: try this: https://github.com/HongyangGao/ChannelNets/blob/master/model.py
+    cur_out_num = 32
+    data_format = kwargs.get('data_format', 'NHWC')
+    outs = ops.conv2d(images, cur_out_num, (3, 3), 'conv_s', train=False,
+            stride=2, act_fn=None, data_format=data_format)
+    cur_outs = ops.dw_block(  # 112 * 112 * 64
+        outs, cur_out_num, 1, 'conv_1_0', 1.0,
+        False, data_format=data_format)
+    outs = tf.concat([outs, cur_outs], axis=-1, name='add0')
+    cur_out_num *= 2
+    outs = ops.dw_block(  # 56 * 56 * 128
+        outs, cur_out_num, 2, 'conv_1_1', 1.0,
+        False, data_format=data_format)
+    cur_outs = ops.dw_block(  # 56 * 56 * 128
+        outs, cur_out_num, 1, 'conv_1_2', 1.0,
+        False, data_format=data_format)
+    outs = tf.concat([outs, cur_outs], axis=-1, name='add1')
+    outs = ops.dw_block(  # 7 * 7 * 1024
+            outs, cur_out_num, 1, 'conv_3_1', 1.0,
+            False, 
+            data_format=data_format)
+    layer_3 = conv_to_fc(outs)
+    return activ(linear(layer_3, 'fc1', n_hidden=512, init_scale=np.sqrt(2)))
+
+    
 
 ALGOS = {
     'a2c': A2C,
@@ -49,6 +237,17 @@ class CustomDQNPolicy(FeedForwardPolicy):
                                               feature_extraction="mlp")
 
 
+
+class CustomLowerFlopCnnPolicy(CnnPolicy):
+    def __init__(self, *args, **kwargs):
+        super(CustomLowerFlopCnnPolicy, self).__init__(*args, **kwargs, cnn_extractor=lower_flop_nature_cnn)
+
+
+class SmallMobileNetCnnPolicy(CnnPolicy):
+    def __init__(self, *args, **kwargs):
+        super(SmallMobileNetCnnPolicy, self).__init__(*args, **kwargs, cnn_extractor=mobilenet_cnn)
+
+
 class CustomMlpPolicy(BasePolicy):
     def __init__(self, *args, **kwargs):
         super(CustomMlpPolicy, self).__init__(*args, **kwargs,
@@ -65,6 +264,8 @@ class CustomSACPolicy(SACPolicy):
 
 register_policy('CustomSACPolicy', CustomSACPolicy)
 register_policy('CustomDQNPolicy', CustomDQNPolicy)
+register_policy('SmallMobileNetCnnPolicy', SmallMobileNetCnnPolicy)
+register_policy('CustomLowerFlopCnnPolicy', CustomLowerFlopCnnPolicy)
 register_policy('CustomMlpPolicy', CustomMlpPolicy)
 
 

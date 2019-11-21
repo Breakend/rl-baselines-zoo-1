@@ -1,4 +1,5 @@
 import argparse
+from stable_baselines import logger
 import difflib
 import os
 from collections import OrderedDict
@@ -30,7 +31,13 @@ from stable_baselines.ppo2.ppo2 import constfn
 from utils import make_env, ALGOS, linear_schedule, get_latest_run_id, get_wrapper_class
 from utils.hyperparams_opt import hyperparam_optimization
 from utils.noise import LinearNormalActionNoise
-
+from experiment_impact_tracker.compute_tracker import ImpactTracker
+from experiment_impact_tracker.utils import get_flop_count_tensorflow
+from experiment_impact_tracker.cpu.common import assert_cpus_by_attributes
+from experiment_impact_tracker.gpu.nvidia import assert_gpus_by_attributes 
+import json
+import time
+import csv
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -44,6 +51,9 @@ if __name__ == '__main__':
                         type=int)
     parser.add_argument('--log-interval', help='Override log interval (default: -1, no change)', default=-1,
                         type=int)
+    parser.add_argument('--evaluate-interval', help='Override log interval (default: -1, no change)', default=250000,
+                        type=int)
+    parser.add_argument('--hparam_file', type=str, help="the hyperparam file spec")
     parser.add_argument('-f', '--log-folder', help='Log folder', type=str, default='logs')
     parser.add_argument('--seed', help='Random generator seed', type=int, default=0)
     parser.add_argument('--n-trials', help='Number of trials for optimizing hyperparameters', type=int, default=10)
@@ -57,8 +67,15 @@ if __name__ == '__main__':
     parser.add_argument('--verbose', help='Verbose mode (0: no output, 1: INFO)', default=1,
                         type=int)
     parser.add_argument('--gym-packages', type=str, nargs='+', default=[], help='Additional external Gym environemnt package modules to import (e.g. gym_minigrid)')
+    parser.add_argument('--cpu-only', action="store_true", default=False)
+    parser.add_argument('--ignore-hardware', action="store_true", default=False)
     args = parser.parse_args()
 
+    if not args.ignore_hardware:
+        if not args.cpu_only:
+            assert_gpus_by_attributes({ "name" : "GeForce GTX TITAN X"})
+        assert_cpus_by_attributes({ "brand": "Intel(R) Xeon(R) CPU E5-2640 v3 @ 2.60GHz" }) 
+   
     # Going through custom gym packages to let them register in the global registory
     for env_module in args.gym_packages:
         importlib.import_module(env_module)
@@ -94,6 +111,13 @@ if __name__ == '__main__':
 
     for env_id in env_ids:
         tensorboard_log = None if args.tensorboard_log == '' else os.path.join(args.tensorboard_log, env_id)
+        os.environ["OPENAI_LOG_FORMAT"] = 'csv'
+        os.environ["OPENAI_LOGDIR"] = os.path.abspath(tensorboard_log)
+        logger.configure()
+
+        tracker = ImpactTracker(tensorboard_log)
+
+        tracker.launch_impact_monitor()
 
         is_atari = False
         if 'NoFrameskip' in env_id:
@@ -102,7 +126,11 @@ if __name__ == '__main__':
         print("=" * 10, env_id, "=" * 10)
 
         # Load hyperparameters from yaml file
-        with open('hyperparams/{}.yml'.format(args.algo), 'r') as f:
+        if args.hparam_file:
+            hparam_file_name = args.hparam_file
+        else:
+            hparam_file_name = 'hyperparams/{}.yml'.format(args.algo)
+        with open(hparam_file_name, 'r') as f:
             hyperparams_dict = yaml.load(f)
             if env_id in list(hyperparams_dict.keys()):
                 hyperparams = hyperparams_dict[env_id]
@@ -178,7 +206,7 @@ if __name__ == '__main__':
         if 'env_wrapper' in hyperparams.keys():
             del hyperparams['env_wrapper']
 
-        def create_env(n_envs):
+        def create_env(n_envs, test=False):
             """
             Create the environment and wrap it if necessary
             :param n_envs: (int)
@@ -189,7 +217,7 @@ if __name__ == '__main__':
             if is_atari:
                 if args.verbose > 0:
                     print("Using Atari wrapper")
-                env = make_atari_env(env_id, num_env=n_envs, seed=args.seed)
+                env = make_atari_env(env_id, num_env=n_envs, seed=args.seed, wrapper_kwargs=dict(clip_rewards=(not test), episode_life=(not test)))
                 # Frame-stacking with 4 frames
                 env = VecFrameStack(env, n_stack=4)
             elif algo_ in ['dqn', 'ddpg']:
@@ -305,11 +333,96 @@ if __name__ == '__main__':
             # Train an agent from scratch
             model = ALGOS[args.algo](env=env, tensorboard_log=tensorboard_log, verbose=args.verbose, **hyperparams)
 
+        print("FLOP count {}".format(get_flop_count_tensorflow(model.graph)))
+
+        model.test_env = create_env(25, test=True)
+
         kwargs = {}
         if args.log_interval > -1:
             kwargs = {'log_interval': args.log_interval}
 
-        model.learn(n_timesteps, **kwargs)
+
+        eval_output_filename = os.path.join(tensorboard_log, 'eval_test.csv')
+        eval_csv_file = open(eval_output_filename, 'w', newline='')
+        eval_csv_file.write(json.dumps(saved_hyperparams))
+        eval_csv_file.write('\n')
+        eval_csv_writer = csv.writer(eval_csv_file, delimiter=',')
+        eval_csv_writer.writerow(['frames','total_time',
+                                      'rmean','rmedian','rmin','rmax','rstd',
+                                      'lmean','lmedian','lmin','lmax','lstd'])
+        start_time = time.time()
+        model.last_time_evaluated = 0
+
+        def callback(_locals, _globals):
+            self_ = _locals['self']
+            # if we've reached the max timesteps run an evaluation no matter what, otherwise every n steps
+            if "update" in _locals:
+                final_update = _locals["update"] == (_locals["total_timesteps"] // self_.n_batch)
+            else:
+                final_update = self_.num_timesteps == (_locals["total_timesteps"] - 1)
+            print("final update {}".format(final_update))
+            if not final_update:
+                if (self_.num_timesteps - self_.last_time_evaluated) < args.evaluate_interval:
+                    return True
+
+            self_.last_time_evaluated = self_.num_timesteps
+            tracker.get_latest_info_and_check_for_errors()
+
+            total_time = time.time() - start_time
+            episode_returns = []
+            lengths = []
+            n_test_episodes = 25 
+            n_episodes, episode_length, reward_sum = 0, 0, 0.0
+
+            # Sync the obs rms if using vecnormalize
+            # NOTE: this does not cover all the possible cases
+            if isinstance(self_.test_env, VecNormalize):
+                self_.test_env.obs_rms = deepcopy(self_.env.obs_rms)
+                # Do not normalize reward
+                self_.test_env.norm_reward = False
+
+            width, height = 84, 84
+            num_ales = n_test_episodes
+
+            obs = self_.test_env.reset()
+
+            lengths = np.zeros(num_ales, dtype=np.int32)
+            rewards = np.zeros(num_ales, dtype=np.int32)
+            all_done = np.zeros(num_ales, dtype=np.bool)
+            not_done = np.ones(num_ales, dtype=np.int32)
+
+            while not all_done.all():
+                actions, _ = self_.predict(obs)
+
+                obs, reward, done, info = self_.test_env.step(actions)
+                
+                done = np.array(done, dtype=np.bool_)
+
+                obs = np.array(obs, dtype=np.float32)
+
+                # update episodic reward counters
+                lengths += not_done
+                rewards += np.array(reward, dtype=np.int32) * not_done
+
+                all_done |= done
+                not_done[:] = np.array(all_done == False, dtype=np.int32)
+
+            returns = rewards
+            rmean = np.mean(returns)
+            rmin = np.min(returns)
+            rmax = np.max(returns)
+            rstd = np.std(returns)
+            lmean = np.mean(lengths)
+            lmin = np.min(lengths)
+            lstd = np.std(lengths)
+            lmax = np.max(lengths)
+            lmedian = np.median(lengths)
+            rmedian = np.median(returns)
+
+            eval_csv_writer.writerow([self_.num_timesteps, total_time, rmean, rmedian, rmin, rmax, rstd, lmean, lmedian, lmin, lmax, lstd])
+            eval_csv_file.flush()
+
+        model.learn(n_timesteps, **kwargs, callback=callback)
 
         # Save trained model
         log_path = "{}/{}/".format(args.log_folder, args.algo)
@@ -332,3 +445,7 @@ if __name__ == '__main__':
                     env = env.venv
                 # Important: save the running average, for testing the agent we need that normalization
                 env.save_running_average(params_path)
+
+
+
+
